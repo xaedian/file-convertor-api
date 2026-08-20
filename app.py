@@ -133,28 +133,65 @@ async def convert_file(
         src.write(content)
         src_path = src.name
 
+    # Intermediate format for PDFs (all pages concatenated vertically)
+    tmp_path = src_path + ".tif"
     dst_path = src_path + ext
 
     try:
-        cmd = ["vips", action, src_path, dst_path]
-
-        # Add format-specific options
         if action == "pdfload":
-            cmd.extend(["--dpi", str(dpi)])
-            cmd.extend(["--page", str(page)])
+            # Step 1: Load ALL pages from PDF, stacked vertically into one tall image
+            load_cmd = ["vips", "pdfload", src_path, tmp_path, "--dpi", str(dpi), "--n", "-1"]
+            if scale != 1.0:
+                load_cmd.extend(["--scale", str(scale)])
 
-        if to_format in QUALITY_FORMATS:
-            cmd.extend(["--Q", str(quality)])
+            logger.info(f"Running: {' '.join(load_cmd)}")
+            result = subprocess.run(load_cmd, capture_output=True, text=True, timeout=120)
 
-        if to_format in SCALE_FORMATS and scale != 1.0:
-            cmd.extend(["--scale", str(scale)])
+            if result.returncode != 0:
+                logger.error(f"Vips pdfload error: {result.stderr}")
+                raise HTTPException(status_code=500, detail=f"PDF load failed: {result.stderr}")
 
-        logger.info(f"Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            # Step 2: Save to target format with quality
+            save_action = {
+                "jpeg": "jpegsave",
+                "jpg": "jpegsave",
+                "png": "pngsave",
+                "webp": "webpsave",
+                "tiff": "tiffsave",
+                "tif": "tiffsave",
+                "avif": "avifsave",
+                "heif": "heifsave",
+                "jxl": "jxlsave",
+            }.get(to_format)
 
-        if result.returncode != 0:
-            logger.error(f"Vips error: {result.stderr}")
-            raise HTTPException(status_code=500, detail=f"Conversion failed: {result.stderr}")
+            if not save_action:
+                raise HTTPException(status_code=400, detail=f"No save action for {to_format}")
+
+            save_cmd = ["vips", save_action, tmp_path, dst_path]
+            if to_format in QUALITY_FORMATS:
+                save_cmd.extend(["--Q", str(quality)])
+
+            logger.info(f"Running: {' '.join(save_cmd)}")
+            result = subprocess.run(save_cmd, capture_output=True, text=True, timeout=120)
+
+            if result.returncode != 0:
+                logger.error(f"Vips save error: {result.stderr}")
+                raise HTTPException(status_code=500, detail=f"Save failed: {result.stderr}")
+
+        else:
+            # Direct image-to-image conversion
+            cmd = ["vips", action, src_path, dst_path]
+            if to_format in QUALITY_FORMATS:
+                cmd.extend(["--Q", str(quality)])
+            if to_format in SCALE_FORMATS and scale != 1.0:
+                cmd.extend(["--scale", str(scale)])
+
+            logger.info(f"Running: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+
+            if result.returncode != 0:
+                logger.error(f"Vips error: {result.stderr}")
+                raise HTTPException(status_code=500, detail=f"Conversion failed: {result.stderr}")
 
         if not os.path.exists(dst_path):
             raise HTTPException(status_code=500, detail="Conversion produced no output file")
@@ -185,6 +222,6 @@ async def convert_file(
         logger.exception("Unexpected error during conversion")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        for path in [src_path, dst_path]:
+        for path in [src_path, dst_path, tmp_path]:
             if os.path.exists(path):
                 os.unlink(path)
